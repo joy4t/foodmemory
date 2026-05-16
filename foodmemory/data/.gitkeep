@@ -1,0 +1,2 @@
+# This directory holds the SQLite database (food_memory.db).
+# The .db file is gitignored — it's created automatically on first run.
