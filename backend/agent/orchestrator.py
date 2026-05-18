@@ -19,6 +19,18 @@ from backend.agent.prompts import (
 from backend.mcp.client import SwiggyMCPClient
 
 
+RATING_PARSE_PROMPT = """Extract rating information from the user's message.
+Return a JSON object with these fields:
+- item_name: the dish they're rating (string)
+- restaurant_name: restaurant name if mentioned (string or null)
+- score: rating from 1-5 (integer)
+- note: any comment about the dish (string or null)
+- would_reorder: whether they'd order again based on sentiment (boolean)
+
+If a field is unclear, make your best guess from context.
+Respond with ONLY the JSON object, no other text."""
+
+
 class AgentOrchestrator:
     def __init__(self):
         self.llm = LLMClient()
@@ -27,11 +39,13 @@ class AgentOrchestrator:
 
     async def process(self, user_id: str, message: str) -> dict:
         """Process a user message and return a response."""
+        # Ensure user exists
+        await self.memory.ensure_user(user_id)
 
         # Step 1: Classify intent
         intent = await self.llm.classify(INTENT_CLASSIFICATION_PROMPT, message)
 
-        # Clean up intent — LLM might return extra text
+        # Clean up intent
         valid_intents = [
             "search_restaurant",
             "browse_menu",
@@ -42,7 +56,6 @@ class AgentOrchestrator:
             "general_chat",
         ]
         if intent not in valid_intents:
-            # Try to find a valid intent in the response
             for vi in valid_intents:
                 if vi in intent:
                     intent = vi
@@ -68,22 +81,20 @@ class AgentOrchestrator:
 
     async def _handle_search_restaurant(self, user_id: str, message: str) -> dict:
         """Search for restaurants based on user query."""
-        # Extract search query from message
         search_result = await self.mcp.search_restaurants(message)
-
-        # Build context with restaurant data
         context = json.dumps(search_result, indent=2)
 
-        # Get memory context for these restaurants
+        # Enrich with memory
         memory_context = ""
         for restaurant in search_result.get("restaurants", []):
-            mem = await self.memory.get_restaurant_memory(
-                user_id, restaurant["id"]
-            )
+            mem = await self.memory.get_restaurant_memory(user_id, restaurant["id"])
             if mem.get("ratings"):
-                memory_context += (
-                    f"\nUser's history at {restaurant['name']}: {mem}\n"
-                )
+                memory_context += f"\nUser's history at {restaurant['name']}:\n"
+                for r in mem["ratings"]:
+                    memory_context += f"  - {r['item_name']}: {r['score']}/5"
+                    if r["note"]:
+                        memory_context += f" (\"{r['note']}\")"
+                    memory_context += "\n"
 
         full_context = context
         if memory_context:
@@ -99,8 +110,7 @@ class AgentOrchestrator:
         }
 
     async def _handle_browse_menu(self, user_id: str, message: str) -> dict:
-        """Show a restaurant's menu."""
-        # Try to find which restaurant the user means
+        """Show a restaurant's menu with memory overlay."""
         search_result = await self.mcp.search_restaurants(message)
         restaurants = search_result.get("restaurants", [])
 
@@ -110,7 +120,6 @@ class AgentOrchestrator:
                 "data": None,
             }
 
-        # Use the first matching restaurant
         restaurant = restaurants[0]
         menu_result = await self.mcp.get_restaurant_menu(restaurant["id"])
 
@@ -136,18 +145,21 @@ class AgentOrchestrator:
         }
 
     async def _handle_add_to_cart(self, user_id: str, message: str) -> dict:
-        """Add items to cart. For now, acknowledge and guide."""
-        reply = await self.llm.complete(
+        """Add items to cart."""
+        # Get global memory for context
+        global_context = await self.memory.build_global_context(user_id)
+
+        reply = await self.llm.complete_with_context(
             SYSTEM_PROMPT,
+            global_context,
             f"The user wants to add items to their cart. They said: '{message}'. "
             f"Acknowledge their request, confirm what you understood they want to add, "
-            f"and let them know the cart feature is being set up. "
-            f"Ask them to confirm the items and quantities.",
+            f"and let them know the cart feature is being finalized.",
         )
         return {"reply": reply, "data": None}
 
     async def _handle_place_order(self, user_id: str, message: str) -> dict:
-        """Place an order. For now, acknowledge."""
+        """Place an order."""
         reply = await self.llm.complete(
             SYSTEM_PROMPT,
             f"The user wants to place their order. They said: '{message}'. "
@@ -157,19 +169,73 @@ class AgentOrchestrator:
         return {"reply": reply, "data": None}
 
     async def _handle_rate_item(self, user_id: str, message: str) -> dict:
-        """Handle rating a dish."""
-        reply = await self.llm.complete(
-            SYSTEM_PROMPT,
-            f"The user wants to rate a dish. They said: '{message}'. "
-            f"Acknowledge their rating enthusiastically. Ask for a 1-5 star score "
-            f"if they didn't provide one, and ask for a short note about the dish. "
-            f"Let them know you'll remember this for next time.",
+        """Handle rating a dish — parse the rating and store it."""
+        # Use LLM to extract rating details
+        rating_json = await self.llm.complete(RATING_PARSE_PROMPT, message)
+
+        try:
+            # Clean up potential markdown formatting
+            cleaned = rating_json.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[1]
+                cleaned = cleaned.rsplit("```", 1)[0]
+            rating_data = json.loads(cleaned)
+        except (json.JSONDecodeError, IndexError):
+            return {
+                "reply": "I'd love to save your rating! Could you tell me the dish name "
+                         "and a score from 1-5? For example: 'The chicken biryani from "
+                         "Meghana was amazing, 5 stars!'",
+                "data": None,
+            }
+
+        item_name = rating_data.get("item_name", "Unknown dish")
+        restaurant_name = rating_data.get("restaurant_name", "Unknown restaurant")
+        score = rating_data.get("score", 3)
+        note = rating_data.get("note")
+        would_reorder = rating_data.get("would_reorder", True)
+
+        # Find restaurant ID from name
+        search_result = await self.mcp.search_restaurants(restaurant_name)
+        restaurants = search_result.get("restaurants", [])
+        restaurant_id = restaurants[0]["id"] if restaurants else "unknown"
+        if restaurants:
+            restaurant_name = restaurants[0]["name"]
+
+        # Store the rating
+        rating_id = await self.memory.quick_rate(
+            user_id=user_id,
+            item_name=item_name,
+            restaurant_id=restaurant_id,
+            restaurant_name=restaurant_name,
+            score=score,
+            note=note,
+            would_reorder=would_reorder,
         )
-        return {"reply": reply, "data": None}
+
+        # Generate confirmation response
+        stars = "⭐" * score
+        reply = f"Got it! I've saved your rating:\n\n"
+        reply += f"**{item_name}** at {restaurant_name}: {stars} ({score}/5)\n"
+        if note:
+            reply += f"Your note: \"{note}\"\n"
+        if would_reorder:
+            reply += f"\nI'll remember you'd order this again! "
+        else:
+            reply += f"\nNoted that you'd skip this next time. "
+        reply += "I'll use this to give you better recommendations."
+
+        return {
+            "reply": reply,
+            "data": {
+                "rating_id": rating_id,
+                "item_name": item_name,
+                "restaurant_name": restaurant_name,
+                "score": score,
+            },
+        }
 
     async def _handle_recommendation(self, user_id: str, message: str) -> dict:
         """Give food recommendations based on memory."""
-        # Try to identify which restaurant
         search_result = await self.mcp.search_restaurants(message)
         restaurants = search_result.get("restaurants", [])
 
@@ -180,13 +246,20 @@ class AgentOrchestrator:
             memory_context = await self.memory.build_memory_context(
                 user_id, restaurant["id"]
             )
+            # Also get global preferences
+            global_context = await self.memory.build_global_context(user_id)
+
             context = json.dumps(menu_result, indent=2)
             if memory_context:
-                context += f"\n\nUSER'S FOOD MEMORY:\n{memory_context}"
+                context += f"\n\nMEMORY AT THIS RESTAURANT:\n{memory_context}"
+            if global_context:
+                context += f"\n\nOVERALL FOOD PREFERENCES:\n{global_context}"
         else:
-            # General recommendation — search popular
             search_result = await self.mcp.search_restaurants("")
+            global_context = await self.memory.build_global_context(user_id)
             context = json.dumps(search_result, indent=2)
+            if global_context:
+                context += f"\n\nOVERALL FOOD PREFERENCES:\n{global_context}"
 
         reply = await self.llm.complete_with_context(
             RESPONSE_WITH_RECOMMENDATION, context, message
