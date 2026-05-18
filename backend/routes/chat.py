@@ -1,13 +1,17 @@
 from fastapi import APIRouter
 from backend.models.schemas import ChatRequest, ChatResponse
+from backend.agent.orchestrator import AgentOrchestrator
 
 router = APIRouter()
+agent = AgentOrchestrator()
 
 
 @router.post("/", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Main conversation endpoint. Stub — will be wired to agent orchestrator."""
+    """Main conversation endpoint — routes through agent orchestrator."""
+    result = await agent.process(request.user_id, request.message)
     return ChatResponse(
-        reply=f"FoodMemory received: '{request.message}'. Agent orchestrator coming in Phase 5.",
-        intent="stub",
+        reply=result["reply"],
+        intent=result.get("intent"),
+        data=result.get("data"),
     )
