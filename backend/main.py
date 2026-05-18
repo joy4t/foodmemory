@@ -1,5 +1,8 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
 from backend.database import init_db
@@ -25,13 +28,24 @@ app = FastAPI(
 # Allow frontend to talk to backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register routes
+# Register API routes
 app.include_router(health_router)
 app.include_router(chat_router, prefix="/chat", tags=["chat"])
 app.include_router(ratings_router, prefix="/ratings", tags=["ratings"])
+
+# Serve frontend static files
+frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
+app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
+
+
+@app.get("/")
+async def serve_frontend():
+    """Serve the chat UI."""
+    index_path = os.path.join(frontend_dir, "index.html")
+    return FileResponse(index_path)
