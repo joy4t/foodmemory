@@ -191,6 +191,10 @@ class AgentOrchestrator:
         item_name = rating_data.get("item_name", "Unknown dish")
         restaurant_name = rating_data.get("restaurant_name", "Unknown restaurant")
         score = rating_data.get("score", 3)
+        try:
+            score = int(score)
+        except (TypeError, ValueError):
+            score = 3
         note = rating_data.get("note")
         would_reorder = rating_data.get("would_reorder", True)
 
