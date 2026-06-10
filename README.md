@@ -65,4 +65,4 @@ foodmemory/
 
 ---
 
-Built by [@joy4t](https://github.com/joy4t) | Sokka Project
+Built by [@joy4t](https://github.com/joy4t)
